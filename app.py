@@ -1,7 +1,7 @@
 import streamlit as st
 
 from config import APP_TITLE
-from document_store import stats
+from document_store import stats, sync_active_index
 from styles import apply_styles
 from upload_section import render_upload_section
 
@@ -14,9 +14,14 @@ st.set_page_config(
 
 apply_styles()
 
+try:
+    sync_active_index()
+except Exception:
+    pass
+
 current_stats = stats()
 
-if current_stats["files"] > 0 and not st.session_state.get("search_warmed"):
+if current_stats["indexed_files"] > 0 and not st.session_state.get("search_warmed"):
     with st.spinner("Warming up local search engine..."):
         try:
             from rag_engine import warm_up_resources
@@ -71,11 +76,11 @@ with ask_panel:
         "Ask question",
         type="primary",
         use_container_width=True,
-        disabled=current_stats["files"] == 0,
+        disabled=current_stats["indexed_files"] == 0,
     )
 
-    if current_stats["files"] == 0:
-        st.caption("Index at least one PDF to enable question answering.")
+    if current_stats["indexed_files"] == 0:
+        st.caption("Process at least one PDF for the active embedding provider to enable question answering.")
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []

@@ -21,6 +21,12 @@ class StoredFile:
     updated_at: float
 
 
+def active_index_key() -> str:
+    from rag_engine import embedding_provider
+
+    return embedding_provider()
+
+
 def ensure_storage() -> None:
     DATA_FOLDER.mkdir(exist_ok=True)
 
@@ -87,13 +93,14 @@ def save_manifest(manifest: dict) -> None:
         json.dump(manifest, f, indent=2, sort_keys=True)
 
 
-def chunk_count(item: dict) -> int:
-    if item.get("chunks"):
-        return int(item.get("chunks", 0))
-
+def chunk_count(item: dict, provider: str | None = None) -> int:
+    provider = provider or active_index_key()
     indexes = item.get("indexes")
-    if isinstance(indexes, dict) and isinstance(indexes.get("local"), dict):
-        return int(indexes["local"].get("chunks", 0))
+    if isinstance(indexes, dict) and isinstance(indexes.get(provider), dict):
+        return int(indexes[provider].get("chunks", 0))
+
+    if provider == "local" and item.get("chunks"):
+        return int(item.get("chunks", 0))
 
     return 0
 
@@ -107,6 +114,7 @@ def count_pdf_pages(path: Path) -> int:
 
 def list_files() -> list[StoredFile]:
     manifest = load_manifest()
+    provider = active_index_key()
     files = []
     for file_id, item in manifest["files"].items():
         path = Path(item.get("path", ""))
@@ -119,7 +127,7 @@ def list_files() -> list[StoredFile]:
                 path=str(path),
                 size=int(item.get("size", 0)),
                 pages=int(item.get("pages", 0)),
-                chunks=chunk_count(item),
+                chunks=chunk_count(item, provider),
                 created_at=float(item.get("created_at", 0)),
                 updated_at=float(item.get("updated_at", 0)),
             )
@@ -134,7 +142,22 @@ def stats() -> dict:
         "pages": sum(item.pages for item in files),
         "chunks": sum(item.chunks for item in files),
         "size": sum(item.size for item in files),
+        "indexed_files": sum(1 for item in files if item.chunks > 0),
     }
+
+
+def sync_active_index() -> int:
+    manifest = load_manifest()
+    provider = active_index_key()
+    allowed_file_ids = {
+        file_id
+        for file_id, item in manifest["files"].items()
+        if chunk_count(item, provider) > 0
+    }
+
+    from rag_engine import delete_database_files_not_in
+
+    return delete_database_files_not_in(allowed_file_ids)
 
 
 def add_uploaded_files(uploaded_files: Iterable) -> dict:
@@ -181,18 +204,80 @@ def add_uploaded_files(uploaded_files: Iterable) -> dict:
             continue
 
         now = time.time()
+        existing_item = manifest["files"].get(file_id, {})
+        indexes = existing_item.get("indexes", {})
+        if not isinstance(indexes, dict):
+            indexes = {}
+        indexes[active_index_key()] = {
+            "chunks": chunks,
+            "updated_at": now,
+        }
         manifest["files"][file_id] = {
             "name": original_name,
             "path": str(save_path),
             "size": len(data),
             "pages": page_count,
-            "chunks": chunks,
-            "created_at": manifest["files"].get(file_id, {}).get("created_at", now),
+            "chunks": chunks if active_index_key() == "local" else int(existing_item.get("chunks", 0)),
+            "indexes": indexes,
+            "created_at": existing_item.get("created_at", now),
             "updated_at": now,
         }
         added.append(original_name)
 
     save_manifest(manifest)
+    return {
+        "added": added,
+        "skipped": skipped,
+        "errors": errors,
+        "seconds": round(time.time() - started, 2),
+    }
+
+
+def process_saved_files() -> dict:
+    manifest = load_manifest()
+    added = []
+    skipped = []
+    errors = []
+    started = time.time()
+
+    for file_id, item in list(manifest["files"].items()):
+        path = Path(item.get("path", ""))
+        name = item.get("name", path.name)
+        if not path.exists():
+            continue
+
+        try:
+            from rag_engine import clean_indexing_error, has_file_in_database, index_pdf_file
+
+            if chunk_count(item) > 0 and has_file_in_database(file_id):
+                skipped.append(name)
+                continue
+
+            page_count = count_pdf_pages(path)
+            chunks = index_pdf_file(path, file_id=file_id, source_name=name)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            errors.append(f"{name}: {clean_indexing_error(exc)}")
+            continue
+
+        now = time.time()
+        indexes = item.get("indexes", {})
+        if not isinstance(indexes, dict):
+            indexes = {}
+        indexes[active_index_key()] = {
+            "chunks": chunks,
+            "updated_at": now,
+        }
+        item["pages"] = page_count
+        item["chunks"] = chunks if active_index_key() == "local" else int(item.get("chunks", 0))
+        item["indexes"] = indexes
+        item["updated_at"] = now
+        manifest["files"][file_id] = item
+        added.append(name)
+
+    save_manifest(manifest)
+    sync_active_index()
     return {
         "added": added,
         "skipped": skipped,

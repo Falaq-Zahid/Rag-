@@ -202,6 +202,20 @@ def get_collection():
     return client.get_or_create_collection(name=collection_name)
 
 
+def delete_database_files_not_in(allowed_file_ids: set[str]) -> int:
+    collection = get_collection()
+    result = collection.get(include=["metadatas"])
+    ids_to_delete = []
+    for doc_id, metadata in zip(result.get("ids", []), result.get("metadatas", [])):
+        file_id = (metadata or {}).get("file_id")
+        if file_id not in allowed_file_ids:
+            ids_to_delete.append(doc_id)
+
+    if ids_to_delete:
+        collection.delete(ids=ids_to_delete)
+    return len(ids_to_delete)
+
+
 @lru_cache(maxsize=1)
 def get_groq_client():
     from groq import Groq
