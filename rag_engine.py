@@ -32,9 +32,8 @@ os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
 BATCH_SIZE = 100
 JINA_BATCH_SIZE = 50
-JINA_MAX_RETRIES = 5
-JINA_RETRY_BASE_SECONDS = 2
-JINA_RETRY_MAX_SECONDS = 60
+JINA_MAX_RETRIES = 10
+JINA_RETRY_DELAYS = (2, 4, 8, 12)
 
 
 class RetrievedDoc:
@@ -148,14 +147,7 @@ def embed_with_jina(texts: list[str], task: str) -> list[list[float]]:
             if exc.code != 429 or attempt == JINA_MAX_RETRIES - 1:
                 raise RuntimeError(f"Jina embeddings API error {exc.code}: {detail}") from exc
 
-            retry_after = exc.headers.get("Retry-After")
-            if retry_after and retry_after.isdigit():
-                wait_seconds = min(int(retry_after), JINA_RETRY_MAX_SECONDS)
-            else:
-                wait_seconds = min(
-                    JINA_RETRY_BASE_SECONDS * (2**attempt),
-                    JINA_RETRY_MAX_SECONDS,
-                )
+            wait_seconds = JINA_RETRY_DELAYS[attempt % len(JINA_RETRY_DELAYS)]
             log(
                 f"[embed] jina rate limit attempt={attempt + 1}/{JINA_MAX_RETRIES} "
                 f"waiting={wait_seconds}s"
