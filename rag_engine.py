@@ -21,13 +21,6 @@ from config import (
     JINA_EMBEDDING_DIMENSIONS,
     JINA_EMBEDDING_MODEL,
     JINA_EMBEDDING_URL,
-    JINA_BATCH_DELAY_SECONDS,
-    JINA_HUGE_BATCH_SIZE,
-    JINA_HUGE_FILE_CHUNKS,
-    JINA_LARGE_BATCH_SIZE,
-    JINA_LARGE_FILE_CHUNKS,
-    JINA_RATE_LIMIT_WAIT_SECONDS,
-    JINA_SMALL_BATCH_SIZE,
     MAX_CHUNK_CONTEXT_CHARS,
     MAX_TOTAL_CONTEXT_CHARS,
     RETRIEVAL_K,
@@ -55,11 +48,6 @@ def total_seconds(timings: dict) -> float:
         sum(value for value in timings.values() if isinstance(value, (int, float))),
         2,
     )
-
-
-def is_rate_limit_error(exc: Exception) -> bool:
-    message = str(exc).lower()
-    return "429" in message or "rate" in message or "tokens per minute" in message
 
 
 def clean_indexing_error(exc: Exception) -> str:
@@ -159,14 +147,6 @@ def embed_with_jina(texts: list[str], task: str) -> list[list[float]]:
     if len(embeddings) != len(texts) or any(not embedding for embedding in embeddings):
         raise RuntimeError("Jina embeddings API returned an unexpected response.")
     return embeddings
-
-
-def jina_initial_batch_size(total_chunks: int) -> int:
-    if total_chunks >= JINA_HUGE_FILE_CHUNKS:
-        return JINA_HUGE_BATCH_SIZE
-    if total_chunks >= JINA_LARGE_FILE_CHUNKS:
-        return JINA_LARGE_BATCH_SIZE
-    return JINA_SMALL_BATCH_SIZE
 
 
 def embed_locally(texts: list[str]) -> list[list[float]]:
@@ -278,34 +258,14 @@ def index_pdf_file(path: Path, file_id: str, source_name: str) -> int:
 
     collection = get_collection()
     delete_file_from_database(file_id)
-
-    provider = embedding_provider()
-    batch_size = BATCH_SIZE
-    if provider == "jina":
-        batch_size = jina_initial_batch_size(len(texts))
-    total_batches = (len(texts) + batch_size - 1) // batch_size
-
-    start = 0
-    batch_number = 1
-    while start < len(texts):
-        end = min(start + batch_size, len(texts))
+    total_batches = (len(texts) + BATCH_SIZE - 1) // BATCH_SIZE
+    for start in range(0, len(texts), BATCH_SIZE):
+        end = start + BATCH_SIZE
         batch_texts = texts[start:end]
+        batch_number = (start // BATCH_SIZE) + 1
         batch_started = time.perf_counter()
-        log(f"[index] batch {batch_number}/{total_batches} embedding source={source_name} size={len(batch_texts)} batch_size={batch_size}")
-        try:
-            embeddings = embed_texts(batch_texts, task="retrieval.passage")
-        except RuntimeError as exc:
-            if provider == "jina" and is_rate_limit_error(exc):
-                if batch_size > 1:
-                    batch_size = max(1, batch_size // 2)
-                    total_batches = batch_number - 1 + ((len(texts) - start + batch_size - 1) // batch_size)
-                    log(f"[index] jina rate limit hit. Reducing batch_size={batch_size} and waiting {JINA_RATE_LIMIT_WAIT_SECONDS}s before retry.")
-                else:
-                    log(f"[index] jina rate limit hit at minimum batch_size=1. Waiting {JINA_RATE_LIMIT_WAIT_SECONDS}s before retry.")
-                time.sleep(JINA_RATE_LIMIT_WAIT_SECONDS)
-                continue
-            raise
-
+        log(f"[index] batch {batch_number}/{total_batches} embedding source={source_name} size={len(batch_texts)}")
+        embeddings = embed_texts(batch_texts, task="retrieval.passage")
         log(f"[index] batch {batch_number}/{total_batches} upserting source={source_name}")
         collection.upsert(
             ids=ids[start:end],
@@ -314,11 +274,6 @@ def index_pdf_file(path: Path, file_id: str, source_name: str) -> int:
             metadatas=metadatas[start:end],
         )
         log(f"[index] batch {batch_number}/{total_batches} done source={source_name} seconds={round(time.perf_counter() - batch_started, 2)}")
-        start = end
-        batch_number += 1
-        if provider == "jina" and start < len(texts) and JINA_BATCH_DELAY_SECONDS > 0:
-            log(f"[index] waiting {JINA_BATCH_DELAY_SECONDS}s before next Jina batch")
-            time.sleep(JINA_BATCH_DELAY_SECONDS)
 
     log(f"[index] done source={source_name} chunks={len(chunks)} total_seconds={round(time.perf_counter() - total_started, 2)}")
     return len(chunks)
