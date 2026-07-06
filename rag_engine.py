@@ -1,6 +1,9 @@
+import json
 import os
 import re
 import time
+import urllib.error
+import urllib.request
 from functools import lru_cache
 from pathlib import Path
 
@@ -15,6 +18,9 @@ from config import (
     FASTEMBED_CACHE,
     FASTEMBED_MODEL,
     GROQ_GENERATION_MODEL,
+    JINA_EMBEDDING_DIMENSIONS,
+    JINA_EMBEDDING_MODEL,
+    JINA_EMBEDDING_URL,
     MAX_CHUNK_CONTEXT_CHARS,
     MAX_TOTAL_CONTEXT_CHARS,
     RETRIEVAL_K,
@@ -33,6 +39,10 @@ class RetrievedDoc:
         self.metadata = metadata or {}
 
 
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
 def total_seconds(timings: dict) -> float:
     return round(
         sum(value for value in timings.values() if isinstance(value, (int, float))),
@@ -42,6 +52,12 @@ def total_seconds(timings: dict) -> float:
 
 def clean_indexing_error(exc: Exception) -> str:
     message = str(exc).lower()
+    if "jina" in message and ("api key" in message or "401" in message or "403" in message):
+        return "Jina API key is missing, invalid, or not allowed. Please check JINA_API_KEY."
+    if "jina" in message and ("rate" in message or "429" in message or "tokens" in message):
+        return "Jina embedding limit reached. Please wait or top up your Jina API key."
+    if "jina" in message and ("timeout" in message or "connection" in message or "network" in message):
+        return "Jina embeddings API is not reachable right now. Please check your internet connection."
     if "fastembed model is not downloaded yet" in message:
         return "FastEmbed model is not downloaded yet, and download failed. Connect internet once so FastEmbed can cache the model locally."
     if (
@@ -59,6 +75,17 @@ def clean_indexing_error(exc: Exception) -> str:
 
 def get_api_key() -> str | None:
     return os.getenv("GROQ_API_KEY")
+
+
+def embedding_provider() -> str:
+    provider = os.getenv("EMBEDDING_PROVIDER", "local").strip().lower()
+    if provider not in {"local", "jina"}:
+        return "local"
+    return provider
+
+
+def get_jina_api_key() -> str | None:
+    return os.getenv("JINA_API_KEY") or os.getenv("JINA_TOKEN")
 
 
 @lru_cache(maxsize=1)
@@ -83,7 +110,46 @@ def get_cached_onnx_model():
     return ONNXMiniLM_L6_V2()
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
+def embed_with_jina(texts: list[str], task: str) -> list[list[float]]:
+    api_key = get_jina_api_key()
+    if not api_key:
+        raise RuntimeError("Jina API key is missing. Add JINA_API_KEY to your environment.")
+
+    payload = {
+        "model": JINA_EMBEDDING_MODEL,
+        "task": task,
+        "normalized": True,
+        "dimensions": JINA_EMBEDDING_DIMENSIONS,
+        "input": texts,
+    }
+    request = urllib.request.Request(
+        JINA_EMBEDDING_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "rag-knowledge-assistant/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Jina embeddings API error {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Jina embeddings network error: {exc}") from exc
+
+    rows = sorted(body.get("data", []), key=lambda item: item.get("index", 0))
+    embeddings = [row.get("embedding") for row in rows]
+    if len(embeddings) != len(texts) or any(not embedding for embedding in embeddings):
+        raise RuntimeError("Jina embeddings API returned an unexpected response.")
+    return embeddings
+
+
+def embed_locally(texts: list[str]) -> list[list[float]]:
     try:
         return [embedding.tolist() for embedding in get_fastembed_model().embed(texts)]
     except Exception as fastembed_exc:
@@ -97,6 +163,17 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
             raise RuntimeError(clean_indexing_error(fastembed_exc)) from fallback_exc
 
 
+def embed_texts(texts: list[str], task: str = "retrieval.passage") -> list[list[float]]:
+    if embedding_provider() == "jina":
+        try:
+            log(f"[embed] provider=jina task={task} texts={len(texts)}")
+            return embed_with_jina(texts, task)
+        except Exception as exc:
+            raise RuntimeError(clean_indexing_error(exc)) from exc
+    log(f"[embed] provider=local task={task} texts={len(texts)}")
+    return embed_locally(texts)
+
+
 @lru_cache(maxsize=1)
 def get_collection():
     import chromadb
@@ -104,7 +181,11 @@ def get_collection():
     DB_FOLDER.mkdir(exist_ok=True)
 
     client = chromadb.PersistentClient(path=str(DB_FOLDER))
-    return client.get_or_create_collection(name=COLLECTION_NAME)
+    collection_name = COLLECTION_NAME
+    if embedding_provider() == "jina":
+        collection_name = f"{COLLECTION_NAME}_jina"
+    log(f"[chroma] provider={embedding_provider()} collection={collection_name}")
+    return client.get_or_create_collection(name=collection_name)
 
 
 @lru_cache(maxsize=1)
@@ -126,6 +207,8 @@ def warm_up_resources() -> dict:
 def _load_pdf(path: Path, file_id: str, source_name: str):
     from langchain_community.document_loaders import PyMuPDFLoader
 
+    started = time.perf_counter()
+    log(f"[index] loading PDF source={source_name}")
     loader = PyMuPDFLoader(str(path))
     documents = []
     for doc in loader.load():
@@ -139,16 +222,21 @@ def _load_pdf(path: Path, file_id: str, source_name: str):
             }
         )
         documents.append(doc)
+    log(f"[index] loaded pages={len(documents)} source={source_name} seconds={round(time.perf_counter() - started, 2)}")
     return documents
 
 
 def index_pdf_file(path: Path, file_id: str, source_name: str) -> int:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+    total_started = time.perf_counter()
+    log(f"[index] start source={source_name} provider={embedding_provider()}")
     documents = _load_pdf(path, file_id=file_id, source_name=source_name)
     if not documents:
         raise ValueError("No readable text found in this PDF.")
 
+    started = time.perf_counter()
+    log(f"[index] chunking source={source_name} chunk_size={CHUNK_SIZE} overlap={CHUNK_OVERLAP}")
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
@@ -156,6 +244,7 @@ def index_pdf_file(path: Path, file_id: str, source_name: str) -> int:
     chunks = splitter.split_documents(documents)
     if not chunks:
         raise ValueError("No readable chunks found in this PDF.")
+    log(f"[index] chunks={len(chunks)} source={source_name} seconds={round(time.perf_counter() - started, 2)}")
 
     ids = []
     texts = []
@@ -169,16 +258,24 @@ def index_pdf_file(path: Path, file_id: str, source_name: str) -> int:
 
     collection = get_collection()
     delete_file_from_database(file_id)
+    total_batches = (len(texts) + BATCH_SIZE - 1) // BATCH_SIZE
     for start in range(0, len(texts), BATCH_SIZE):
         end = start + BATCH_SIZE
         batch_texts = texts[start:end]
+        batch_number = (start // BATCH_SIZE) + 1
+        batch_started = time.perf_counter()
+        log(f"[index] batch {batch_number}/{total_batches} embedding source={source_name} size={len(batch_texts)}")
+        embeddings = embed_texts(batch_texts, task="retrieval.passage")
+        log(f"[index] batch {batch_number}/{total_batches} upserting source={source_name}")
         collection.upsert(
             ids=ids[start:end],
-            embeddings=embed_texts(batch_texts),
+            embeddings=embeddings,
             documents=batch_texts,
             metadatas=metadatas[start:end],
         )
+        log(f"[index] batch {batch_number}/{total_batches} done source={source_name} seconds={round(time.perf_counter() - batch_started, 2)}")
 
+    log(f"[index] done source={source_name} chunks={len(chunks)} total_seconds={round(time.perf_counter() - total_started, 2)}")
     return len(chunks)
 
 
@@ -336,7 +433,10 @@ def search_documents(question: str):
         timings["search_mode"] = "keyword"
         return docs, timings
 
-    result = collection.query(query_embeddings=embed_texts([question]), n_results=RETRIEVAL_K)
+    result = collection.query(
+        query_embeddings=embed_texts([question], task="retrieval.query"),
+        n_results=RETRIEVAL_K,
+    )
     timings["search"] = round(time.perf_counter() - started, 2)
     timings["search_mode"] = "vector"
 

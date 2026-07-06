@@ -10,6 +10,9 @@ MANIFEST_PATH = DATA_FOLDER / "manifest.json"
 COLLECTION_NAME = "rag_fast_docs"
 
 FASTEMBED_MODEL = "BAAI/bge-small-en-v1.5"
+JINA_EMBEDDING_MODEL = "jina-embeddings-v5-text-small"
+JINA_EMBEDDING_DIMENSIONS = 1024
+JINA_EMBEDDING_URL = "https://api.jina.ai/v1/embeddings"
 GROQ_GENERATION_MODEL = "llama-3.3-70b-versatile"
 CHUNK_SIZE = 4000
 CHUNK_OVERLAP = 100
