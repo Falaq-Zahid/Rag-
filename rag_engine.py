@@ -31,6 +31,10 @@ load_dotenv()
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
 BATCH_SIZE = 100
+JINA_BATCH_SIZE = 50
+JINA_MAX_RETRIES = 5
+JINA_RETRY_BASE_SECONDS = 2
+JINA_RETRY_MAX_SECONDS = 60
 
 
 class RetrievedDoc:
@@ -122,25 +126,43 @@ def embed_with_jina(texts: list[str], task: str) -> list[list[float]]:
         "dimensions": JINA_EMBEDDING_DIMENSIONS,
         "input": texts,
     }
-    request = urllib.request.Request(
-        JINA_EMBEDDING_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": "rag-knowledge-assistant/1.0",
-        },
-        method="POST",
-    )
+    body = None
+    for attempt in range(JINA_MAX_RETRIES):
+        request = urllib.request.Request(
+            JINA_EMBEDDING_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "rag-knowledge-assistant/1.0",
+            },
+            method="POST",
+        )
 
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Jina embeddings API error {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Jina embeddings network error: {exc}") from exc
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code != 429 or attempt == JINA_MAX_RETRIES - 1:
+                raise RuntimeError(f"Jina embeddings API error {exc.code}: {detail}") from exc
+
+            retry_after = exc.headers.get("Retry-After")
+            if retry_after and retry_after.isdigit():
+                wait_seconds = min(int(retry_after), JINA_RETRY_MAX_SECONDS)
+            else:
+                wait_seconds = min(
+                    JINA_RETRY_BASE_SECONDS * (2**attempt),
+                    JINA_RETRY_MAX_SECONDS,
+                )
+            log(
+                f"[embed] jina rate limit attempt={attempt + 1}/{JINA_MAX_RETRIES} "
+                f"waiting={wait_seconds}s"
+            )
+            time.sleep(wait_seconds)
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Jina embeddings network error: {exc}") from exc
 
     rows = sorted(body.get("data", []), key=lambda item: item.get("index", 0))
     embeddings = [row.get("embedding") for row in rows]
@@ -258,11 +280,12 @@ def index_pdf_file(path: Path, file_id: str, source_name: str) -> int:
 
     collection = get_collection()
     delete_file_from_database(file_id)
-    total_batches = (len(texts) + BATCH_SIZE - 1) // BATCH_SIZE
-    for start in range(0, len(texts), BATCH_SIZE):
-        end = start + BATCH_SIZE
+    batch_size = JINA_BATCH_SIZE if embedding_provider() == "jina" else BATCH_SIZE
+    total_batches = (len(texts) + batch_size - 1) // batch_size
+    for start in range(0, len(texts), batch_size):
+        end = start + batch_size
         batch_texts = texts[start:end]
-        batch_number = (start // BATCH_SIZE) + 1
+        batch_number = (start // batch_size) + 1
         batch_started = time.perf_counter()
         log(f"[index] batch {batch_number}/{total_batches} embedding source={source_name} size={len(batch_texts)}")
         embeddings = embed_texts(batch_texts, task="retrieval.passage")
