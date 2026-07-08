@@ -162,4 +162,7 @@ This project is for personal and educational use.
 
 ## Author
 
-Built by Falaq Zahid.
+Built by:
+1. Falaq Zahid
+2. Minahil Ashraf
+3. Ayesha Tanveer
